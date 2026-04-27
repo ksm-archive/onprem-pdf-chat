@@ -35,11 +35,11 @@ with st.sidebar:
                 with open(file_path, "wb") as f:
                     f.write(uploaded_file.getvalue())
                 
-                # PDF 로드 및 분할
+                # PDF 로드 및 분할 (정교한 검색을 위해 조각 크기를 500으로 조정)
                 loader = PyPDFLoader(file_path)
                 docs = loader.load()
                 
-                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
                 splits = text_splitter.split_documents(docs)
                 
                 # 임베딩 생성 및 벡터 DB 구축 (FAISS)
@@ -101,55 +101,62 @@ if st.session_state.current_doc:
         if isinstance(vectorstore_or_splits, list):
             context = "\n".join([d.page_content for d in vectorstore_or_splits[:3]])
         else:
-            # 질문과 가장 유사한 내용 3개를 벡터 DB에서 검색하여 문맥으로 사용
-            retrieved_docs = vectorstore_or_splits.similarity_search(user_question, k=3)
+            # 질문과 가장 유사한 내용 5개를 벡터 DB에서 검색하여 문맥으로 사용 (정확도 향상)
+            retrieved_docs = vectorstore_or_splits.similarity_search(user_question, k=5)
             context = "\n".join([d.page_content for d in retrieved_docs])
             
-        system_prompt = {'role': 'system', 'content': f'당신은 문서 도우미입니다. 다음 내용을 참고해서 대답하세요:\n\n[참고 자료]\n{context}'}
+        # Ollama에 보낼 메시지 구성
+        # 문서 팩트 우선 + 외부 지식 보완의 균형 잡힌 프롬프트
+        system_prompt = {
+            'role': 'system', 
+            'content': (
+                f'당신은 문서의 내용을 기반으로 전문적인 답변을 제공하는 기술 파트너입니다.\n'
+                f'지식 활용 우선순위:\n'
+                f'1. [최우선]: 제공된 [참고 자료]의 팩트를 기반으로 답변하세요.\n'
+                f'2. [보완]: [참고 자료]의 내용을 설명하기 위해 필요한 배경 지식이나 기술적 원리는 당신의 전문 지식을 활용해 풍부하게 덧붙이세요.\n'
+                f'3. [확장]: 사용자가 추가 설명을 원할 경우, 문서의 맥락을 벗어나지 않는 선에서 외부 지식을 활용해 상세히 설명하세요.\n\n'
+                f'규칙:\n'
+                f'1. 반드시 한국어로 정중하게 답변하세요.\n'
+                f'2. 가독성을 위해 소제목(##)과 강조(**text**)를 적절히 사용하세요.\n'
+                f'3. 한자나 일본어는 절대 사용하지 마세요.\n\n'
+                f'[참고 자료]\n{context}'
+            )
+        }
         
-        ollama_messages = [system_prompt] + st.session_state.chat_histories[current_doc]
+        ollama_messages = [system_prompt] + st.session_state.chat_histories[current_doc][-10:]
         
         # AI 답변 화면에 표시 및 저장
         with st.chat_message("assistant"):
-            # 로딩 메시지 표시용 공간
-            status_placeholder = st.empty()
-            status_placeholder.info("⏳ AI가 답변을 생각하고 있습니다...")
-            
             try:
-                # 스트리밍 모드로 답변 받기
-                # 한국어 성능이 매우 뛰어난 초경량 모델 qwen2.5:3b를 사용합니다.
-                stream = ollama.chat(
-                    model='qwen2.5:3b', 
-                    messages=ollama_messages, 
-                    stream=True,
-                    options={
-                        'temperature': 0,        # 답변의 일관성을 높이고 헛소리를 줄임
-                        'repeat_penalty': 1.5,   # 동일 문장 반복 생성 억제
-                        'top_p': 0.9             # 답변의 품질 향상
-                    }
-                )
+                # 1. AI가 생각을 시작하는 동안만 스피너 표시
+                with st.spinner("AI가 답변을 생성 중입니다..."):
+                    stream = ollama.chat(
+                        model='llama3.1', 
+                        messages=ollama_messages, 
+                        stream=True,
+                        options={
+                            'temperature': 0.3,      # 풍부한 설명을 위해 창의성을 약간 허용
+                            'num_ctx': 2048,
+                            'repeat_penalty': 1.2,
+                        }
+                    )
+                    # 첫 번째 청크가 도착할 때까지 대기 (여기서 스피너가 유지됨)
+                    first_chunk = next(stream)
                 
-                # 첫 번째 청크를 받아오면서 상태 메시지 바로 지우기 (잔상 버그 완전 해결)
-                first_chunk = next(stream)
-                status_placeholder.empty()
-                
+                # 2. 첫 글자가 도착하면 여기서부터 타이핑 시작 (스피너는 위 블록을 벗어나며 사라짐)
                 def generate_response():
-                    # 미리 받아온 첫 글자 출력
                     content = first_chunk.get('message', {}).get('content', '')
                     if content:
                         yield content
-                    # 나머지 스트리밍 출력
                     for chunk in stream:
                         content = chunk.get('message', {}).get('content', '')
                         if content:
                             yield content
                             
-                # st.write_stream이 잔상 문제를 방지하고 타이핑 효과를 깔끔하게 처리합니다.
                 full_response = st.write_stream(generate_response())
-                
                 st.session_state.chat_histories[current_doc].append({"role": "assistant", "content": full_response})
+                
             except Exception as e:
-                status_placeholder.empty()
                 st.error(f"오류가 발생했습니다: {str(e)}")
                 st.info("💡 팁: 이전 대화 내용이 너무 길어 메모리가 부족하거나 Ollama 서버가 멈췄을 수 있습니다.")
 
