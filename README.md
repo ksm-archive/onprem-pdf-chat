@@ -17,7 +17,3 @@ Streamlit (Web UI) -> LangChain (RAG Pipeline) -> Ollama (Llama 3.1 LLM)
 ```bash
 uv run streamlit run app.py
 ```
-
-## LLM 설정 
-https://github.com/kubionet/llm-setup
-
