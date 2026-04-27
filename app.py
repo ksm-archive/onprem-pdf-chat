@@ -3,6 +3,8 @@ import ollama
 import os
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_ollama import OllamaEmbeddings
+from langchain_community.vectorstores import FAISS
 
 st.set_page_config(page_title="나만의 로컬 AI 문서 비서", page_icon="📚", layout="wide")
 
@@ -40,8 +42,13 @@ with st.sidebar:
                 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
                 splits = text_splitter.split_documents(docs)
                 
-                # 상태 저장
-                st.session_state.docs_library[file_name] = splits
+                # 임베딩 생성 및 벡터 DB 구축 (FAISS)
+                # 가볍고 성능이 뛰어난 임베딩 전용 모델(nomic-embed-text)을 사용합니다.
+                embeddings = OllamaEmbeddings(model="nomic-embed-text")
+                vectorstore = FAISS.from_documents(splits, embeddings)
+                
+                # 상태 저장 (이제 텍스트 리스트 대신 벡터 DB 객체를 저장)
+                st.session_state.docs_library[file_name] = vectorstore
                 st.session_state.chat_histories[file_name] = []
                 st.session_state.current_doc = file_name
             
@@ -87,10 +94,18 @@ if st.session_state.current_doc:
         with st.chat_message("user"):
             st.markdown(user_question)
             
-        # Ollama에 보낼 메시지 구성
-        splits = st.session_state.docs_library[current_doc]
-        context = "\n".join([d.page_content for d in splits[:3]]) # 우선 상위 3개 조각만 참조
-        system_prompt = {'role': 'system', 'content': f'당신은 문서 도우미입니다. 다음 내용을 참고해서 대답하세요: {context}'}
+        # 질문 기반으로 벡터 검색 (유사한 문서 조각 추출)
+        vectorstore_or_splits = st.session_state.docs_library[current_doc]
+        
+        # 이전 버전(splits 리스트) 캐시 호환성 처리
+        if isinstance(vectorstore_or_splits, list):
+            context = "\n".join([d.page_content for d in vectorstore_or_splits[:3]])
+        else:
+            # 질문과 가장 유사한 내용 3개를 벡터 DB에서 검색하여 문맥으로 사용
+            retrieved_docs = vectorstore_or_splits.similarity_search(user_question, k=3)
+            context = "\n".join([d.page_content for d in retrieved_docs])
+            
+        system_prompt = {'role': 'system', 'content': f'당신은 문서 도우미입니다. 다음 내용을 참고해서 대답하세요:\n\n[참고 자료]\n{context}'}
         
         ollama_messages = [system_prompt] + st.session_state.chat_histories[current_doc]
         
@@ -101,16 +116,30 @@ if st.session_state.current_doc:
             status_placeholder.info("⏳ AI가 답변을 생각하고 있습니다...")
             
             try:
-                # 스트리밍 모드로 답변 받기 (제너레이터 함수 활용)
-                stream = ollama.chat(model='llama3.1', messages=ollama_messages, stream=True)
+                # 스트리밍 모드로 답변 받기
+                # 한국어 성능이 매우 뛰어난 초경량 모델 qwen2.5:3b를 사용합니다.
+                stream = ollama.chat(
+                    model='qwen2.5:3b', 
+                    messages=ollama_messages, 
+                    stream=True,
+                    options={
+                        'temperature': 0,        # 답변의 일관성을 높이고 헛소리를 줄임
+                        'repeat_penalty': 1.5,   # 동일 문장 반복 생성 억제
+                        'top_p': 0.9             # 답변의 품질 향상
+                    }
+                )
+                
+                # 첫 번째 청크를 받아오면서 상태 메시지 바로 지우기 (잔상 버그 완전 해결)
+                first_chunk = next(stream)
+                status_placeholder.empty()
                 
                 def generate_response():
-                    first_chunk = True
+                    # 미리 받아온 첫 글자 출력
+                    content = first_chunk.get('message', {}).get('content', '')
+                    if content:
+                        yield content
+                    # 나머지 스트리밍 출력
                     for chunk in stream:
-                        if first_chunk:
-                            status_placeholder.empty() # 첫 글자 도착 시 로딩 메시지 지움
-                            first_chunk = False
-                            
                         content = chunk.get('message', {}).get('content', '')
                         if content:
                             yield content
