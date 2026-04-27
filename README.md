@@ -19,5 +19,5 @@ Streamlit (Web UI)
 
 ## 사용법
 ```bash
-uv run streamlit run app.py
+uv run python -m streamlit run app.py
 ```
